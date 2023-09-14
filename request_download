@@ -1,0 +1,281 @@
+report ZVOLKAN_TEST.
+
+type-pools: SABC, STMS, TRWBO.
+
+parameters:
+  P_REQEST      type TRKORR obligatory,
+  P_FOLDER(255) type C lower case,
+  P_SEPR        obligatory.
+
+selection-screen skip.
+parameters P_XZIP type XFELD.
+
+data:
+  GV_RETVAL        like table of DDSHRETVAL with header line,
+  GV_FLDVALUE      like HELP_INFO-FLDVALUE,
+  GV_TRANSDIR      type TEXT255,
+  GV_FILENAME(255),
+  GV_TRFILE(20)    type C,
+  DATATAB          type table of TEXT8192 with header line,
+  GV_FLEN          type I,
+  GV_ZIP_FILENAME  type STRING.
+
+
+initialization.
+  concatenate SY-SYSID 'K*' into P_REQEST.
+
+  if SY-OPSYS = 'Windows NT'.
+    P_SEPR = '\'.
+  else.
+    P_SEPR = '/'.
+  endif.
+
+
+at selection-screen on value-request for P_REQEST.
+  data:
+    TT_SYSTEM           type table of TMSCSYS with header line,
+    ES_SELECTED_REQUEST type TRWBO_REQUEST_HEADER,
+    ES_SELECTED_TASK    type TRWBO_REQUEST_HEADER,
+    IV_ORGANIZER_TYPE   type TRWBO_CALLING_ORGANIZER,
+    IS_SELECTION        type TRWBO_SELECTION.
+
+  IV_ORGANIZER_TYPE = 'W'. IS_SELECTION-REQSTATUS = 'R'.
+  call function 'TR_PRESENT_REQUESTS_SEL_POPUP'
+    exporting
+      IV_ORGANIZER_TYPE   = IV_ORGANIZER_TYPE
+      IS_SELECTION        = IS_SELECTION
+    importing
+      ES_SELECTED_REQUEST = ES_SELECTED_REQUEST
+      ES_SELECTED_TASK    = ES_SELECTED_TASK.
+  P_REQEST = ES_SELECTED_REQUEST-TRKORR.
+
+at selection-screen on value-request for P_FOLDER.
+  perform DIRECTORY_BROWSE changing P_FOLDER.
+
+at selection-screen on P_REQEST.
+  data: REQUEST_INFO  type STMS_WBO_REQUEST,
+        REQUEST_INFOS type STMS_WBO_REQUESTS.
+
+  refresh REQUEST_INFOS.
+  call function 'TMS_MGR_READ_TRANSPORT_REQUEST'
+    exporting
+      IV_REQUEST                 = P_REQEST
+      IV_HEADER_ONLY             = 'X'
+    importing
+      ET_REQUEST_INFOS           = REQUEST_INFOS
+    exceptions
+      READ_CONFIG_FAILED         = 1
+      TABLE_OF_REQUESTS_IS_EMPTY = 2
+      SYSTEM_NOT_AVAILABLE       = 3
+      others                     = 4.
+
+  if SY-SUBRC ne 0.
+    message id SY-MSGID type SY-MSGTY number SY-MSGNO
+    with SY-MSGV1 SY-MSGV2 SY-MSGV3 SY-MSGV4.
+  endif.
+  clear REQUEST_INFO.
+  read table REQUEST_INFOS into REQUEST_INFO index 1.
+  if SY-SUBRC ne 0
+  or REQUEST_INFO-E070-TRKORR is initial.
+    message E398(00) with 'Request'(006) P_REQEST 'not found'(007).
+  elseif REQUEST_INFO-E070-TRSTATUS ne 'R'.
+    message E398(00)
+    with 'You must release request'(008)
+    REQUEST_INFO-E070-TRKORR
+    'before downloading'(009).
+  endif.
+
+start-of-selection.
+
+  concatenate P_REQEST+3(7) '.' P_REQEST(3) into GV_TRFILE.
+  call function 'RSPO_R_SAPGPARAM'
+    exporting
+      NAME   = 'DIR_TRANS'
+    importing
+      VALUE  = GV_TRANSDIR
+    exceptions
+      ERROR  = 0
+      others = 0.
+
+  data(LO_ZIP) = new CL_ABAP_ZIP( ). "Create instance of Zip Class
+
+  perform COPY_FILE using LO_ZIP 'cofiles' GV_TRFILE.
+  GV_TRFILE(1) = 'R'.
+  perform COPY_FILE using LO_ZIP 'data' GV_TRFILE.
+  GV_TRFILE(1) = 'D'.
+  perform COPY_FILE using LO_ZIP 'data' GV_TRFILE.
+
+  if P_XZIP is not initial.
+    data(LV_XZIP) = LO_ZIP->SAVE( ).
+
+    refresh DATATAB.
+    call function 'SCMS_XSTRING_TO_BINARY'
+      exporting
+        BUFFER        = LV_XZIP
+      importing
+        OUTPUT_LENGTH = GV_FLEN
+      tables
+        BINARY_TAB    = DATATAB[].
+
+    concatenate P_FOLDER '\' P_REQEST '.zip' into GV_ZIP_FILENAME.
+
+    CL_GUI_FRONTEND_SERVICES=>GUI_DOWNLOAD(
+      exporting
+        FILENAME          = GV_ZIP_FILENAME
+        FILETYPE          = 'BIN'
+        BIN_FILESIZE      = GV_FLEN
+      importing
+        FILELENGTH        = GV_FLEN
+      changing
+        DATA_TAB          = DATATAB[]
+      exceptions
+        others            = 1 ).
+
+    if SY-SUBRC <> 0.
+      if 0 = 1. message E005(/PIT/AB_MESSAGES) with 1 2 3 4. endif.
+    endif.
+
+  endif.
+
+**********************************************************************
+  "Forms
+**********************************************************************
+form COPY_FILE using  IO_ZIP type ref to CL_ABAP_ZIP
+                      SUBDIR
+                      FNAME.
+  data:
+    LV_AUTH_FILENAME type AUTHB-FILENAME,
+    LV_GUI_FILENAME  type STRING,
+    LV_LEN           type I.
+
+  concatenate GV_TRANSDIR SUBDIR FNAME
+  into GV_FILENAME
+  separated by P_SEPR.
+
+  refresh DATATAB.
+  clear GV_FLEN.
+
+  LV_AUTH_FILENAME = GV_FILENAME.
+  call function 'AUTHORITY_CHECK_DATASET'
+    exporting
+      ACTIVITY         = SABC_ACT_READ
+      GV_FILENAME      = LV_AUTH_FILENAME
+    exceptions
+      NO_AUTHORITY     = 1
+      ACTIVITY_UNKNOWN = 2
+      others           = 3.
+
+  if SY-SUBRC ne 0.
+    format color col_negative.
+    write: / 'Read access denied. File'(001),
+    GV_FILENAME.
+    format color off. exit.
+  endif.
+
+  open dataset GV_FILENAME for input in binary mode.
+
+  if SY-SUBRC ne 0.
+    format color col_total.
+    write: / 'File open error'(010), GV_FILENAME.
+    format color off. exit.
+  endif.
+
+  do.
+    clear LV_LEN.
+    read dataset GV_FILENAME into DATATAB length LV_LEN.
+    GV_FLEN = GV_FLEN + LV_LEN.
+    if LV_LEN > 0. append DATATAB. endif.
+    if SY-SUBRC ne 0.
+      exit.
+    endif.
+  enddo.
+  close dataset GV_FILENAME.
+  concatenate P_FOLDER '\' FNAME into LV_GUI_FILENAME.
+
+  if P_XZIP is not initial.
+    data LV_XFILE type XSTRING.
+    call function 'SCMS_BINARY_TO_XSTRING'
+      exporting
+        INPUT_LENGTH = GV_FLEN
+      importing
+        BUFFER       = LV_XFILE
+      tables
+        BINARY_TAB   = DATATAB[].
+
+    call method IO_ZIP->ADD
+      exporting
+        NAME    = conv STRING( FNAME )
+        CONTENT = LV_XFILE.
+  else.
+
+    call method CL_GUI_FRONTEND_SERVICES=>GUI_DOWNLOAD
+      exporting
+        BIN_FILESIZE            = GV_FLEN
+        FILENAME                = LV_GUI_FILENAME
+        FILETYPE                = 'BIN'
+      changing
+        DATA_TAB                = DATATAB[]
+      exceptions
+        FILE_WRITE_ERROR        = 1
+        NO_BATCH                = 2
+        GUI_REFUSE_FILETRANSFER = 3
+        INVALID_TYPE            = 4
+        NO_AUTHORITY            = 5
+        UNKNOWN_ERROR           = 6
+        HEADER_NOT_ALLOWED      = 7
+        SEPARATOR_NOT_ALLOWED   = 8
+        FILESIZE_NOT_ALLOWED    = 9
+        HEADER_TOO_LONG         = 10
+        DP_ERROR_CREATE         = 11
+        DP_ERROR_SEND           = 12
+        DP_ERROR_WRITE          = 13
+        UNKNOWN_DP_ERROR        = 14
+        ACCESS_DENIED           = 15
+        DP_OUT_OF_MEMORY        = 16
+        DISK_FULL               = 17
+        DP_TIMEOUT              = 18
+        FILE_NOT_FOUND          = 19
+        DATAPROVIDER_EXCEPTION  = 20
+        CONTROL_FLUSH_ERROR     = 21
+        others                  = 24.
+
+    if SY-SUBRC = 0.
+      write: / 'File'(002), GV_FILENAME, 'downloaded. Length'(003), GV_FLEN.
+    else.
+      format color col_negative.
+      write: / 'File download error. gv_FILENAME:'(004), GV_FILENAME.
+      format color off.
+    endif.
+
+  endif.
+
+
+endform. "COPY_FILE
+
+*&---------------------------------------------------------------------*
+*&      Form  DIRECTORY_BROWSE
+*&---------------------------------------------------------------------*
+form DIRECTORY_BROWSE  changing CV_FOLDER.
+  data: LV_TITLE  type STRING,
+        LV_FOLDER type STRING.
+
+  LV_TITLE = 'Select target folder'(005).
+  call method CL_GUI_FRONTEND_SERVICES=>DIRECTORY_BROWSE
+    exporting
+      WINDOW_TITLE    = LV_TITLE
+    changing
+      SELECTED_FOLDER = LV_FOLDER
+    exceptions
+      CNTL_ERROR      = 1
+      ERROR_NO_GUI    = 2
+      others          = 3.
+
+  call function 'CONTROL_FLUSH'
+    exceptions
+      CNTL_SYSTEM_ERROR = 1
+      CNTL_ERROR        = 2
+      others            = 3.
+
+  CV_FOLDER = LV_FOLDER.
+
+endform.
